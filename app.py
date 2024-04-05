@@ -3,8 +3,9 @@ import queue
 import re
 import sys
 import time
-
+import signal
 import threading
+
 # for opencv
 import cv2
 import dlib
@@ -14,14 +15,17 @@ from google.cloud import speech
 import pyaudio
 import multiprocessing
 
-# Audio recording parameters
-STREAMING_LIMIT = 240000  # 4 minutes
-SAMPLE_RATE = 16000
-CHUNK_SIZE = int(SAMPLE_RATE / 10)  # 100ms
+# computer microphone
+FORMAT    =pyaudio.paInt32  
+CHANNELS  =1
+FS        =16000
+CHUNK     =int(FS/15)
 
-RED = "\033[0;31m"
-GREEN = "\033[0;32m"
-YELLOW = "\033[0;33m"
+# microphone array
+# FORMAT    =pyaudio.paInt32  
+# CHANNELS  =16
+# fs        =48000
+# CHUNK     =int(fs/15)
 
 
 def get_current_time() -> int:
@@ -33,6 +37,9 @@ def get_current_time() -> int:
 
     return int(round(time.time() * 1000))
 
+def handler_SIGINT(signum, frame):
+    global flag_run_ctrl_c
+    flag_run_ctrl_c=False
 
 class ResumableMicrophoneStream:
     """Opens a recording stream as a generator yielding the audio chunks."""
@@ -274,88 +281,71 @@ def listen_print_loop(responses: object, stream: object) -> object:
         if (stream.last_transcript_was_final):
             return transcript
             
-    
-def background_task(msg_queue):
-    while True:
-        # Your logic here to generate messages, for example, based on microphone input
-        # This example simply puts a static message into the queue
-        msg_queue.put(("Background Message", time.time()))
-        time.sleep(3)
+def read_data(stream):
+    """
+    Reads data from audio stream & returns 1 x (CHANNELS * CHUNK) np array
+    """
+    # recording the data
+    data = stream.read(CHUNK, exception_on_overflow = True)
+    data_sample = np.frombuffer(data, dtype=np.int32)
+    data_sample = np.reshape(data_sample, (CHANNELS, CHUNK), order='F')
+    # data = np.reshape(data, (-1, CHANNELS))
+    return data_sample
 
-def main(msg_queue):
-    """start bidirectional streaming from microphone input to speech API"""
-    client = speech.SpeechClient()
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=SAMPLE_RATE,
-        language_code="en-US",
-        max_alternatives=1,
-    )
+def loop_mic_v2(flag_run, paras):
+    p                 =pyaudio.PyAudio()
+    info              =p.get_host_api_info_by_index(0)
+    numdevices        =info.get('deviceCount')
+    target_device_name="nanoSHARC micArray16 UAC2.0"
 
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=config, interim_results=True
-    )
+    # Find target device
+    # for i in range(0, numdevices):
+    #     if (p.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels'))>0:
+    #         tmp=p.get_device_info_by_host_api_device_index(0, i).get('name')
+    #         print(tmp)
+    #         if tmp.find(target_device_name)>=0:
+    #             device_index = i
+    #             break
 
-    mic_manager = ResumableMicrophoneStream(SAMPLE_RATE, CHUNK_SIZE)
-    print(mic_manager.chunk_size)
-    sys.stdout.write(YELLOW)
-    sys.stdout.write('\nListening, say "Quit" or "Exit" to stop.\n\n')
-    sys.stdout.write("End (ms)       Transcript Results/Status\n")
-    sys.stdout.write("=====================================================\n")
+    # Open device
+    stream=p.open(format            =paras['FORMAT'],
+                  channels          =paras['n_channels'],
+                  rate              =paras['fs'],
+                  input             =True,
+                  frames_per_buffer =paras['n_samples_per_chunk'],
+                  #input_device_index=device_index
+                  )
 
-    with mic_manager as stream:
-        while not stream.closed:
-            sys.stdout.write(YELLOW)
-            sys.stdout.write(
-                "\n" + str(STREAMING_LIMIT * stream.restart_counter) + ": NEW REQUEST\n"
-            )
-
-            stream.audio_input = []
-            audio_generator = stream.generator()
-
-            requests = (
-                speech.StreamingRecognizeRequest(audio_content=content)
-                for content in audio_generator
-            )
-
-            responses = client.streaming_recognize(streaming_config, requests)
-
-            # Now, put the transcription responses to use.
-            response = listen_print_loop(responses, stream)
-            if stream.result_end_time > 0:
-                stream.final_request_end_time = stream.is_final_end_time
-            stream.result_end_time = 0
-            stream.last_audio_input = []
-            stream.last_audio_input = stream.audio_input
-            stream.audio_input = []
-            stream.restart_counter = stream.restart_counter + 1
-            msg_queue.put((response, time.time()))
-            if not stream.last_transcript_was_final:
-                stream.new_stream = True
-                sys.stdout.write("\n")
-                
-            
+    data_audio=np.array([], dtype=np.int32).reshape(CHANNELS, 0)
 
 
-if __name__ == "__main__":
-    # Start the background thread
-    # message_queue = queue.Queue()
-    # bg_thread = threading.Thread(target=background_task, args=(message_queue,))
-    # bg_thread.daemon = True  # Daemonize thread
-    # bg_thread.start()
-    # main_thread = threading.Thread(target=main, args=(message_queue,))
-    # main_thread.daemon = True
-    # main_thread.start()
+    while flag_run.value==0:
+        frame_audio=read_data(stream)   # (# of channels, # of samples)
 
-    message_queue = multiprocessing.Queue()
-    bg_process = multiprocessing.Process(target=main, args=(message_queue,))
-    bg_process.daemon = True
-    bg_process.start()
+    # wav_file = wave.open("out.wav", "wb")
+    # wav_file.setparams((n_channels, sample_width, sample_rate, n_frames, comptype, compname))
 
+    while flag_run.value:
+        frame_audio=read_data(stream) # (# of channels, # of samples)
+        
+        # if paras['flag_record']:
+        data_audio=np.hstack((data_audio, frame_audio))
+        print(data_audio.shape)
+        # wav_file.writeframes()
 
+        # Audio to heatmap
+        # np.copyto(frame_audio_share, frame_audio)
+
+    # Close all
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+    return
+def loop_cam(flag_run, paras):
     PREDICTOR_PATH = r"face_detector/shape_predictor_68_face_landmarks.dat"
-    LIP_DIST_CUTOFF = 5.0
 
+    LIP_DIST_CUTOFF = 5.0
     detector = dlib.get_frontal_face_detector()
 
     cap = cv2.VideoCapture(0)
@@ -365,9 +355,7 @@ if __name__ == "__main__":
     message_display_time = 0
     display_duration = 3
 
-    while True:
-        start = time.time()
-        
+    while flag_run.value:
         success, image = cap.read()
         h, w = image.shape[:2]
 
@@ -399,7 +387,8 @@ if __name__ == "__main__":
             if dist > LIP_DIST_CUTOFF or (last_message and current_time - message_display_time < display_duration):
                 if current_time - message_display_time >= display_duration:
                     try:
-                        last_message, message_display_time = message_queue.get_nowait()
+                        #last_message, message_display_time = message_queue.get_nowait()
+                        print("returned from Google API")
                     except queue.Empty:
                         pass  # No new message, keep displaying the last one
 
@@ -417,10 +406,126 @@ if __name__ == "__main__":
             cap.release()
             break
     
-    message_queue.close()
-    message_queue.join_thread()
-    bg_process.terminate()
-    bg_process.join()
     cv2.destroyAllWindows() 
     cv2.waitKey(1)
+
+def main():
+    global flag_run_ctrl_c
+    flag_run_ctrl_c=True
+    signal.signal(signal.SIGINT, handler_SIGINT)
+    paras={}
+    paras['cam_idx']=0
+
+    paras['FORMAT']             =FORMAT  
+    paras['n_channels']         =CHANNELS
+    paras['fs']                 =FS
+    paras['n_samples_per_chunk']=CHUNK
+    paras['frame_audio_shape']=(paras['n_channels'], paras['n_samples_per_chunk'])
+
+    flag_run =multiprocessing.Value('i', 1)
+
+    p_cam    =multiprocessing.Process(target=loop_cam,      args=(flag_run, paras,))
+    p_mic    =multiprocessing.Process(target=loop_mic_v2,   args=(flag_run, paras,))
+
+    p_cam.start()
+    p_mic.start()
+
+    flag_run.value=0
+    print("Waiting for mic and cam to setup...")
+    time.sleep(3)
+    flag_run.value=1
+
+    t_run=15
+    print("Recording for "+str(t_run)+" secs")
+    for i in range(t_run, 0, -1):
+        print("Time remain (sec):", i)
+        time.sleep(1)
+
+        if flag_run_ctrl_c==False:
+            break
+    print("loop_process closed")
+
+
+
+
+
+    # Close
+    flag_run.value=0
+    p_cam.join()
+    p_mic.join()
+    print(" stopped properly ~")
+    sys.exit()
+                
+def transcribe_streaming(stream_file: str) -> speech.RecognitionConfig:
+    """Streams transcription of the given audio file."""
+
+    client = speech.SpeechClient()
+
+    with open(stream_file, "rb") as audio_file:
+        content = audio_file.read()
+
+    # In practice, stream should be a generator yielding chunks of audio data.
+    stream = [content]
+
+    requests = (
+        speech.StreamingRecognizeRequest(audio_content=chunk) for chunk in stream
+    )
+
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=8000,
+        language_code="en-US",
+    )
+
+    streaming_config = speech.StreamingRecognitionConfig(config=config)
+
+    # streaming_recognize returns a generator.
+    responses = client.streaming_recognize(
+        config=streaming_config,
+        requests=requests,
+    )
+
+    for response in responses:
+        # Once the transcription has settled, the first result will contain the
+        # is_final result. The other results will be for subsequent portions of
+        # the audio.
+        for result in response.results:
+            print(f"Finished: {result.is_final}")
+            print(f"Stability: {result.stability}")
+            alternatives = result.alternatives
+            # The alternatives are ordered from most likely to least.
+            for alternative in alternatives:
+                print(f"Confidence: {alternative.confidence}")
+                print(f"Transcript: {alternative.transcript}")
+
+    
+
+
+if __name__ == "__main__":
+    # Start the background thread
+    # message_queue = queue.Queue()
+    # bg_thread = threading.Thread(target=background_task, args=(message_queue,))
+    # bg_thread.daemon = True  # Daemonize thread
+    # bg_thread.start()
+    # main_thread = threading.Thread(target=main, args=(message_queue,))
+    # main_thread.daemon = True
+    # main_thread.start()
+
+    try:
+        def important(x):
+            return chr(x)
+        i = "I"
+        a = important(ord("A")-10 + 8 + 2)
+        o = important("O")
+        x = important(ord("X"))
+        last_name = f"{x}{i}{a}{o}"
+        name = f"{last_name} Huo"
+        message = f"Happy Birthday {name}!"
+        print(f"{message}")
+    except Exception as e:
+        print("Happy Birthday Xiao Huo!")
+    main()
+
+
+    
     # main()
